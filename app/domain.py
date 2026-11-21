@@ -83,6 +83,10 @@ class RehearsalRecord:
     order: tuple[str, ...]
     reservations: dict[str, ReservationRecord] = field(default_factory=dict)
     pending: str | None = None
+    # Extra bandwidth each tunnel would like to send during the rehearsal
+    # (non-negative integer Mbps).  Whole-group replacement only; a tunnel that
+    # is never mentioned effectively has a demand of 0.
+    burst_demands: dict[str, int] = field(default_factory=dict)
 
     # ------------------------------------------------------------- derived state
     def tunnel(self, tunnel_id: str) -> TunnelRecord | None:
@@ -90,6 +94,10 @@ class RehearsalRecord:
 
     def link(self, link_id: str) -> LinkRecord | None:
         return next((l for l in self.links if l.link_id == link_id), None)
+
+    def burst_demand_of(self, tunnel_id: str) -> int:
+        """Registered burst demand for a tunnel; missing entries default to 0."""
+        return int(self.burst_demands.get(tunnel_id, 0))
 
     @property
     def moved_count(self) -> int:
@@ -161,6 +169,7 @@ class RehearsalRecord:
                 for rid, r in self.reservations.items()
             },
             "pending": self.pending,
+            "burst_demands": dict(self.burst_demands),
         }
 
     @classmethod
@@ -193,4 +202,10 @@ class RehearsalRecord:
                 for rid, r in doc["reservations"].items()
             },
             pending=doc["pending"],
+            # Documents written before burst support existed simply have no
+            # demands; every tunnel then reads a demand of 0.
+            burst_demands={
+                str(tunnel_id): int(demand)
+                for tunnel_id, demand in doc.get("burst_demands", {}).items()
+            },
         )

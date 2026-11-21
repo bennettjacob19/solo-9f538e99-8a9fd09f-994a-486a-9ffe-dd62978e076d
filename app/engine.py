@@ -32,11 +32,13 @@ from datetime import datetime, timezone
 
 from .domain import RehearsalRecord, ReservationRecord, TunnelRecord
 from .errors import (
+    BurstDemandError,
     Infeasible,
     RehearsalNotFound,
     ReservationInvalid,
     StepConflict,
 )
+from .fairness import Fraction, max_min_fair
 from .planner import explain_infeasible, find_order
 from .store import Store, StoreConflict
 from .validation import build_scenario
@@ -106,6 +108,16 @@ class Engine:
         if record.pending is None:
             return None
         return record.reservations.get(record.pending)
+
+    @classmethod
+    def _reserved(cls, record: RehearsalRecord) -> dict[str, int]:
+        """Bandwidth held by the pending reservation, per link (0 when none)."""
+        reserved = {link.link_id: 0 for link in record.links}
+        pending = cls._pending_reservation(record)
+        if pending is not None:
+            for link_id, bandwidth in pending.charge.items():
+                reserved[link_id] += bandwidth
+        return reserved
 
     def _check_reservable(self, record: RehearsalRecord, tunnel: TunnelRecord) -> None:
         used = self._usage(record)
@@ -228,16 +240,75 @@ class Engine:
             )
         return reservation
 
+    # ------------------------------------------------------------- burst API
+    def register_burst(
+        self, rehearsal_id: str, demands: dict[str, int]
+    ) -> RehearsalRecord:
+        """Whole-group replacement of the burst demands.
+
+        Every tunnel gets an entry: tunnels omitted from ``demands`` reset to
+        0.  Validation happens before any write, so a rejected request leaves
+        the previously registered demands (and everything else) untouched.
+        """
+        known = {tunnel.tunnel_id for tunnel in self._read(rehearsal_id).tunnels}
+        errors: list[str] = []
+        unknown = sorted(set(demands) - known)
+        if unknown:
+            errors.append(
+                "unknown tunnel id(s) in burst demands: " + ", ".join(unknown)
+            )
+        bad = [
+            tunnel_id
+            for tunnel_id, demand in demands.items()
+            if not isinstance(demand, int) or isinstance(demand, bool) or demand < 0
+        ]
+        if bad:
+            errors.append(
+                "burst demand must be a non-negative integer Mbps for: "
+                + ", ".join(sorted(bad))
+            )
+        if errors:
+            raise BurstDemandError(errors)
+
+        replacement = {tunnel_id: int(demands.get(tunnel_id, 0)) for tunnel_id in known}
+        for _ in range(MAX_WRITE_RETRIES):
+            with self._lock:
+                record, version = self._load(rehearsal_id)
+                record.burst_demands = replacement
+                try:
+                    self._store.replace(rehearsal_id, version, record.to_document())
+                except StoreConflict:
+                    continue
+                return record
+        raise StepConflict("the rehearsal is being modified concurrently; retry the request")
+
+    def burst_snapshot(
+        self, rehearsal_id: str
+    ) -> tuple[
+        RehearsalRecord,
+        dict[str, int],
+        dict[str, int],
+        dict[str, Fraction],
+        dict[str, Fraction],
+        dict[str, Fraction],
+    ]:
+        """One consistent snapshot: record, base usage, reservation, burst math.
+
+        All six views are derived from the same document under the engine lock,
+        so a reported demand/quota/path/link-usage tuple can never mix two
+        states.
+        """
+        with self._lock:
+            record = self._read(rehearsal_id)
+            used = self._usage(record)
+            reserved = self._reserved(record)
+            quotas, burst_used, spare = max_min_fair(record, used, reserved)
+            return record, used, reserved, quotas, burst_used, spare
+
     # ------------------------------------------------------------------ view
     def view(
         self, rehearsal_id: str
     ) -> tuple[RehearsalRecord, dict[str, int], dict[str, int]]:
         with self._lock:
             record = self._read(rehearsal_id)
-            used = self._usage(record)
-            pending = self._pending_reservation(record)
-            reserved = {link.link_id: 0 for link in record.links}
-            if pending is not None:
-                for link_id, bandwidth in pending.charge.items():
-                    reserved[link_id] += bandwidth
-            return record, used, reserved
+            return record, self._usage(record), self._reserved(record)

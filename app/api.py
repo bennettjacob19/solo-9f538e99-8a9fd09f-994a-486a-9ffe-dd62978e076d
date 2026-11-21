@@ -5,7 +5,14 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Request
 
 from .domain import RehearsalRecord
+from .fairness import Fraction, fraction_payload
 from .models import (
+    BurstAllocationOut,
+    BurstDemandsIn,
+    BurstDemandsOut,
+    BurstLinkOut,
+    BurstQuotaOut,
+    FractionOut,
     LinkUsageOut,
     OrderStepOut,
     PendingOut,
@@ -36,6 +43,46 @@ def _steps(record: RehearsalRecord) -> list[OrderStepOut]:
     ]
 
 
+def _fraction(value: Fraction) -> FractionOut:
+    return FractionOut(**fraction_payload(value))
+
+
+def _burst_payload(record, quotas, burst_used, spare) -> BurstAllocationOut:
+    """Assemble the burst response from an already-taken consistent snapshot."""
+    demands = {
+        tunnel.tunnel_id: record.burst_demand_of(tunnel.tunnel_id)
+        for tunnel in record.tunnels
+    }
+    return BurstAllocationOut(
+        demands=demands,
+        quotas=[
+            BurstQuotaOut(
+                tunnel_id=tunnel.tunnel_id,
+                demand=demands[tunnel.tunnel_id],
+                quota=_fraction(quotas[tunnel.tunnel_id]),
+                active_path=list(tunnel.active_path),
+            )
+            for tunnel in record.tunnels
+        ],
+        links=[
+            BurstLinkOut(
+                link_id=link.link_id,
+                used=_fraction(burst_used[link.link_id]),
+                available=_fraction(spare[link.link_id]),
+            )
+            for link in record.links
+        ],
+    )
+
+
+def _burst_allocation(engine, rehearsal_id: str) -> BurstAllocationOut:
+    """Take one snapshot and build the whole-group burst response."""
+    record, _used, _reserved, quotas, burst_used, spare = engine.burst_snapshot(
+        rehearsal_id
+    )
+    return _burst_payload(record, quotas, burst_used, spare)
+
+
 @router.post(
     "",
     response_model=RehearsalCreatedOut,
@@ -62,10 +109,13 @@ def create(rehearsal: RehearsalIn, request: Request):
 @router.get(
     "/{rehearsal_id}",
     response_model=RehearsalViewOut,
-    summary="Inspect active paths and per-link used/reserved bandwidth",
+    summary="Inspect active paths, per-link usage and the burst allocation",
 )
 def view(rehearsal_id: str, request: Request):
-    record, used, reserved = _engine(request).view(rehearsal_id)
+    engine = _engine(request)
+    record, used, reserved, quotas, burst_used, spare = engine.burst_snapshot(
+        rehearsal_id
+    )
     pending = None
     if record.pending is not None:
         reservation = record.reservations[record.pending]
@@ -92,6 +142,8 @@ def view(rehearsal_id: str, request: Request):
                 current_path=list(t.active_path),
                 initial_path=list(t.current_path),
                 target_path=list(t.target_path),
+                burst_demand=record.burst_demand_of(t.tunnel_id),
+                burst_quota=_fraction(quotas[t.tunnel_id]),
             )
             for t in record.tunnels
         ],
@@ -104,10 +156,13 @@ def view(rehearsal_id: str, request: Request):
                 used=used[link.link_id],
                 reserved=reserved[link.link_id],
                 available=link.capacity - used[link.link_id] - reserved[link.link_id],
+                burst_used=_fraction(burst_used[link.link_id]),
+                burst_available=_fraction(spare[link.link_id]),
             )
             for link in record.links
         ],
         pending=pending,
+        burst=_burst_payload(record, quotas, burst_used, spare),
     )
 
 
@@ -139,6 +194,7 @@ def reserve(
         current_path=list(tunnel.active_path),
         target_path=list(tunnel.target_path),
         next_tunnel_id=record.next_tunnel_id,
+        burst=_burst_allocation(engine, rehearsal_id),
     )
 
 
@@ -162,6 +218,7 @@ def confirm(rehearsal_id: str, reservation_id: str, request: Request):
         released=tunnel.released(),
         rehearsal_status="completed" if record.completed else "active",
         next_tunnel_id=record.next_tunnel_id,
+        burst=_burst_allocation(engine, rehearsal_id),
     )
 
 
@@ -187,4 +244,38 @@ def cancel(rehearsal_id: str, reservation_id: str, request: Request):
         released={},
         rehearsal_status="completed" if record.completed else "active",
         next_tunnel_id=record.next_tunnel_id,
+        burst=_burst_allocation(engine, rehearsal_id),
+    )
+
+
+@router.put(
+    "/{rehearsal_id}/burst-demands",
+    response_model=BurstDemandsOut,
+    summary="Replace the whole group of burst demands and return the new quotas",
+    responses={
+        404: {"description": "Unknown rehearsal id."},
+        422: {"description": "Unknown tunnel, negative or non-integer demand; state unchanged."},
+    },
+)
+@router.post(
+    "/{rehearsal_id}/burst-demands",
+    response_model=BurstDemandsOut,
+    include_in_schema=False,
+)
+def replace_burst_demands(
+    rehearsal_id: str,
+    request: Request,
+    body: BurstDemandsIn | None = Body(default=None),
+):
+    """Whole-group replacement; omitted tunnels are written back as 0.
+
+    On any validation failure nothing is stored, so the previously registered
+    demands (and the quotas derived from them) stay in force.
+    """
+    engine = _engine(request)
+    demands = body.normalised() if body is not None else {}
+    engine.register_burst(rehearsal_id, demands)
+    return BurstDemandsOut(
+        rehearsal_id=rehearsal_id,
+        burst=_burst_allocation(engine, rehearsal_id),
     )

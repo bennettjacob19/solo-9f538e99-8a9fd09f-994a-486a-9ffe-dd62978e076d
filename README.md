@@ -15,7 +15,7 @@ docker compose up --build
 ```bash
 pip install -r requirements.txt
 uvicorn app.main:app --reload        # DB_PATH 默认 data/migrations.db
-python -m pytest                     # 34 个测试
+python -m pytest                     # 58 个测试
 ```
 
 ## 计费规则
@@ -24,6 +24,44 @@ python -m pytest                     # 34 个测试
 * 每条隧道的现用路径持续占用带宽，直到该隧道**确认切换**为止。
 * 目标路径与现用路径**共有的链路只计一次**：预留时只对「目标路径独有」的链路扣带宽，切换时旧路独有链路的带宽自动释放。
 * 一条路径内同一链路重复出现会被拒绝（避免自环与重复计费）。
+
+## 突发带宽配额
+
+演练期间想在专线上临时多发一些流量时，在 `/docs` 按演练号**整组替换**每条隧道想额外使用的带宽（非负整数 Mbps），服务用最大最小公平算法给出每条隧道实际可用的突发配额。
+
+* **整组替换、漏填按 0**：`PUT /rehearsals/{id}/burst-demands` 一次性写入整组需求，请求里没有出现的隧道需求重置为 0；空请求体等于全部清零。需求为非负整数，未知隧道、负数、小数一律 `422 invalid_burst_demands`，**登记失败保留原需求**，状态不变。
+* **先扣占用与预留**：每条链路先扣除隧道现用带宽 `used` 与待确认预留 `reserved`，剩下的余量才参与突发分配——突发配额给原有改道操作让路。取消预留后余量归还，确认切换后按新现用路径重新分配。
+* **沿途同一份配额**：一条隧道在其**现用路径**的每条链路上使用同一个配额值，且不超过自身需求。
+* **最大最小公平 + 精确分数**：渐进注水（water-filling）求解，全程使用 `fractions.Fraction` 精确有理数，无浮点误差。整数渲染为整数，否则渲染为 `"分子/分母"` 字符串，并同时给出 `numerator`/`denominator` 字段。
+* **同一份状态**：登记、预留、确认、取消成功时都返回按本次写入结果计算的整组配额；`GET /rehearsals/{id}` 中的需求、配额、路径与链路用量取自同一快照，不会跨状态拼接。旧演练（无突发数据）的需求默认为 0。
+
+请求体支持三种等价写法：
+
+```json
+{"T1": 5, "T2": 0}
+{"demands": {"T1": 5, "T2": 0}}
+{"demands": [{"tunnel_id": "T1", "demand": 5}, {"tunnel_id": "T2", "demand": 0}]}
+```
+
+响应中的 `burst` 对象：
+
+```json
+{
+  "demands": {"T1": 10, "T2": 10},
+  "quotas": [
+    {"tunnel_id": "T1", "demand": 10,
+     "quota": {"value": "3/2", "numerator": 3, "denominator": 2},
+     "active_path": ["L3"]}
+  ],
+  "links": [
+    {"link_id": "L3",
+     "used": {"value": 3, "numerator": 3, "denominator": 1},
+     "available": {"value": 0, "numerator": 0, "denominator": 1}}
+  ]
+}
+```
+
+`GET` 详情里每条隧道额外带 `burst_demand`/`burst_quota`，每条链路额外带 `burst_used`/`burst_available`。
 
 ## 接口
 
@@ -34,6 +72,7 @@ python -m pytest                     # 34 个测试
 | `POST` | `/rehearsals/{id}/reservations` | 为**顺序中的下一条**隧道预留带宽，返回预留编号；同一时刻只允许一笔待确认预留 |
 | `POST` | `/rehearsals/{id}/reservations/{rid}/confirm` | 凭编号确认：切换路径并释放旧路独有带宽 |
 | `POST` | `/rehearsals/{id}/reservations/{rid}/cancel` | 凭编号取消：只撤回本次预留，旧路不动，该步可重做 |
+| `PUT` | `/rehearsals/{id}/burst-demands` | 整组替换各隧道的**突发需求**（非负整数 Mbps），返回按本次写入计算的整组配额；`POST` 同路径为别名 |
 | `GET` | `/health` | 存活探针 |
 
 ### 状态约束
@@ -76,5 +115,6 @@ curl -s $BASE/rehearsals/$ID       # 查看各链路已用/预留带宽
 ## 实现要点
 
 * `app/planner.py`：状态只取决于"哪些隧道已切换"，因此在 2^n（n≤10，至多 1024）个子集上做带失败记忆的 DFS，**精确**判定有无可行顺序并给出顺序；有随机场景与穷举对拍的测试。
-* `app/engine.py`：所有状态变更在锁内完成，并以文档版本号做 compare-and-set 提交；并发下只会有一笔预留/一次确认成功。
+* `app/fairness.py`：突发配额的最大最小公平分配（渐进注水），全程 `Fraction` 精确运算；每条隧道沿途共用一份配额、封顶于自身需求，链路余量先扣除现用占用与待确认预留。有独立参考实现的随机对拍测试。
+* `app/engine.py`：所有状态变更在锁内完成，并以文档版本号做 compare-and-set 提交；并发下只会有一笔预留/一次确认成功，突发登记的整组写入也不会出现半更新。
 * `app/store.py`：每次状态变更写一条 JSON 文档（SQLite 或内存），不会出现半更新。

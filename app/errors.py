@@ -49,3 +49,14 @@ class ReservationInvalid(RehearsalError):
 
     code = "reservation_invalid"
     status_code = 409
+
+
+class BurstDemandError(RehearsalError):
+    """A burst-demand registration referenced bad data; nothing was written."""
+
+    code = "invalid_burst_demands"
+    status_code = 422
+
+    def __init__(self, errors: list[str]) -> None:
+        super().__init__("; ".join(errors) or "invalid burst demands")
+        self.errors = errors

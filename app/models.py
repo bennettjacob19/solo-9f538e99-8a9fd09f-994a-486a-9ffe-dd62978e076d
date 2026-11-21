@@ -10,7 +10,14 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 EXAMPLE_SCENARIO: dict[str, Any] = {
     "links": [
@@ -167,7 +174,153 @@ class ReserveIn(BaseModel):
     ]
 
 
+# ------------------------------------------------------------- burst demands
+class BurstDemandItemIn(BaseModel):
+    """One tunnel's requested extra bandwidth, as a list element."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    tunnel_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            validation_alias=AliasChoices("tunnel_id", "id", "tunnel"),
+            description="Tunnel the burst demand applies to.",
+        ),
+    ]
+    demand: Annotated[
+        int,
+        Field(
+            strict=True,
+            ge=0,
+            validation_alias=AliasChoices(
+                "demand", "burst", "burst_demand", "bandwidth", "mbps", "amount"
+            ),
+            description="Extra bandwidth wanted, non-negative integer Mbps.",
+        ),
+    ]
+
+
+class BurstDemandsIn(BaseModel):
+    """Whole-group replacement of the burst demands for a rehearsal.
+
+    Accepted shapes (all equivalent)::
+
+        {"T1": 5, "T2": 0}                       # bare tunnel -> Mbps map
+        {"demands": {"T1": 5}}                   # wrapped map
+        {"demands": [{"tunnel_id": "T1", "demand": 5}]}
+
+    Tunnels omitted from the map are written back as 0.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    demands: Annotated[
+        dict[str, int],
+        Field(
+            default_factory=dict,
+            validation_alias=AliasChoices(
+                "demands", "burst_demands", "requests", "items"
+            ),
+            description="Map of tunnel id to extra bandwidth in non-negative integer Mbps.",
+        ),
+    ]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_bare_shapes(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "demands" not in data and not any(
+            key in data
+            for key in ("burst_demands", "requests", "items")
+        ):
+            # A bare {"T1": 5, "T2": 0} map: every value must be a strict
+            # integer (floats and booleans are refused, never coerced).
+            if data and all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in data.values()
+            ):
+                return {"demands": dict(data)}
+            if data:
+                raise ValueError(
+                    "burst demands must be a map of tunnel id to a non-negative "
+                    "integer Mbps value"
+                )
+        if isinstance(data, list):
+            return {"demands": data}
+        return data
+
+    @field_validator("demands", mode="before")
+    @classmethod
+    def _normalise_list(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            normalised: dict[str, int] = {}
+            for item in value:
+                parsed = BurstDemandItemIn.model_validate(item)
+                # Later entries win, matching an explicit map's last-write feel.
+                normalised[parsed.tunnel_id] = parsed.demand
+            return normalised
+        return value
+
+    @field_validator("demands")
+    @classmethod
+    def _non_negative_integers(cls, value: dict[str, int]) -> dict[str, int]:
+        for tunnel_id, demand in value.items():
+            if isinstance(demand, bool) or not isinstance(demand, int) or demand < 0:
+                raise ValueError(
+                    f"burst demand for {tunnel_id!r} must be a non-negative integer Mbps"
+                )
+        return value
+
+    def normalised(self) -> dict[str, int]:
+        return dict(self.demands)
+
+
 # --------------------------------------------------------------------- outputs
+class FractionOut(BaseModel):
+    """An exact rational number: integer when whole, otherwise ``n/d``."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    value: int | str = Field(
+        description="Exact quota as an integer or a canonical 'numerator/denominator' string."
+    )
+    numerator: int
+    denominator: int = Field(ge=1)
+
+
+class BurstQuotaOut(BaseModel):
+    """One tunnel's registered burst demand and its allocated exact quota."""
+
+    tunnel_id: str
+    demand: int = Field(description="Registered extra bandwidth wanted (integer Mbps).")
+    quota: FractionOut = Field(
+        description="Max-min fair quota used on every link of the tunnel's active path."
+    )
+    active_path: list[str] = Field(
+        description="Active path this quota was computed against."
+    )
+
+
+class BurstLinkOut(BaseModel):
+    """Per-link burst figures, all exact fractions in Mbps."""
+
+    link_id: str
+    used: FractionOut = Field(description="Sum of burst quotas carried on this link.")
+    available: FractionOut = Field(
+        description="Spare capacity after base usage, any pending reservation and burst traffic."
+    )
+
+
+class BurstAllocationOut(BaseModel):
+    """The whole-group burst allocation computed from one stored state."""
+
+    demands: dict[str, int] = Field(
+        description="Effective burst demand per tunnel (unregistered tunnels read 0)."
+    )
+    quotas: list[BurstQuotaOut]
+    links: list[BurstLinkOut]
+
+
 class OrderStepOut(BaseModel):
     sequence: int
     tunnel_id: str
@@ -191,6 +344,13 @@ class TunnelStatusOut(BaseModel):
     current_path: list[str] = Field(description="Path currently carrying traffic.")
     initial_path: list[str]
     target_path: list[str]
+    burst_demand: int = Field(
+        default=0, description="Registered extra bandwidth wanted in integer Mbps."
+    )
+    burst_quota: FractionOut | None = Field(
+        default=None,
+        description="Allocated burst quota for the active path; null when not computed.",
+    )
 
 
 class LinkUsageOut(BaseModel):
@@ -201,6 +361,13 @@ class LinkUsageOut(BaseModel):
     used: int
     reserved: int
     available: int
+    burst_used: FractionOut | None = Field(
+        default=None, description="Burst quota sum carried on the link (exact fraction)."
+    )
+    burst_available: FractionOut | None = Field(
+        default=None,
+        description="Capacity left after base usage, reservation and burst traffic.",
+    )
 
 
 class PendingOut(BaseModel):
@@ -222,6 +389,7 @@ class RehearsalViewOut(BaseModel):
     tunnels: list[TunnelStatusOut]
     links: list[LinkUsageOut]
     pending: PendingOut | None
+    burst: BurstAllocationOut
 
 
 class ReservationOut(BaseModel):
@@ -236,6 +404,9 @@ class ReservationOut(BaseModel):
     current_path: list[str]
     target_path: list[str]
     next_tunnel_id: str | None
+    burst: BurstAllocationOut = Field(
+        description="Whole-group burst allocation after this write."
+    )
 
 
 class ResolutionOut(BaseModel):
@@ -251,3 +422,13 @@ class ResolutionOut(BaseModel):
     )
     rehearsal_status: str
     next_tunnel_id: str | None
+    burst: BurstAllocationOut = Field(
+        description="Whole-group burst allocation after this write."
+    )
+
+
+class BurstDemandsOut(BaseModel):
+    """Response of a whole-group burst-demand replacement."""
+
+    rehearsal_id: str
+    burst: BurstAllocationOut
